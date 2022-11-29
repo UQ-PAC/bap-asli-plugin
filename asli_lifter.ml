@@ -371,7 +371,7 @@ module Make(CT : Theory.Core) = struct
     ) Variables.empty (List.init 32 (fun i -> "R" ^ string_of_int i)) |>
     (* 128-bit registers *)
     (fun prevVars -> List.fold_left (fun vars var -> 
-      Variables.add var (Theory.Var.forget (Theory.Var.define (Theory.Bitv.define 2048) var)) vars
+      Variables.add var (Theory.Var.forget (Theory.Var.define (Theory.Bitv.define 128) var)) vars
     ) prevVars (List.init 32 (fun i -> "V" ^ string_of_int i))) |>
     (* Flags *)
     Variables.add "NF" (Theory.Var.forget (Theory.Var.define (Theory.Bitv.define 1) "NF")) |>
