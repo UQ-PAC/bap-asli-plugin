@@ -261,6 +261,13 @@ module Make(CT : Theory.Core) = struct
       | "not_bool" ->
         let eBool = eUnsorted |> to_bool state.throwErrors in
         CT.inv eBool >>| Theory.Value.forget
+      | "cvt_bool_bv" ->
+        let s = Theory.Bitv.define 1 in
+        let (module MX) = Bitvec.modular 1 in
+        let const x = CT.int (s) (MX.int x) in
+
+        let eBool = eUnsorted |> to_bool state.throwErrors in
+        (CT.ite eBool (const 1) (const 0)) >>| Theory.Value.forget
       | "ZeroExtend" ->
         (* TODO: at the moment relying on implicit extension, may need to do it explicitly *)
         e' >>| Theory.Value.forget
