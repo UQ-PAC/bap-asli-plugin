@@ -198,6 +198,17 @@ module Make(CT : Theory.Core) = struct
       let e2' = compile_expr e2 state |> to_bool state.throwErrors in
       (* TODO: figure out a less hacky way to do eq *)
       CT.or_ (CT.and_ e1' e2') (CT.and_ (CT.inv e1') (CT.inv e2')) >>| Theory.Value.forget
+    | Expr_TApply(f, [], [e1; e2]) ->
+      let e1' = compile_expr e1 state |> to_bool state.throwErrors in
+      let e2' = compile_expr e2 state |> to_bool state.throwErrors in
+      (match Asl_ast.name_of_FIdent f with
+      | "or_bool" ->
+        CT.or_ e1' e2' >>| Theory.Value.forget
+      | "and_bool" ->
+        CT.and_ e1' e2' >>| Theory.Value.forget
+      | n ->
+        fail (Unknown_primop n) state.throwErrors
+      ) 
     | Expr_TApply(f, targs, [e1; e2]) ->
       let e1' = compile_expr e1 state |> to_bits state.throwErrors in
       let e2' = compile_expr e2 state |> to_bits state.throwErrors in
