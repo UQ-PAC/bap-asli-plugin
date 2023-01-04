@@ -7,7 +7,6 @@ open KB.Syntax
 include Self()
 
 module Variables = Map.Make(String)
-
 module Ignored = Set.Make(String)
 
 type KB.Conflict.t +=
@@ -21,30 +20,49 @@ type KB.Conflict.t +=
 
 exception Error of string
 
-let emptyKB = (KB.return (Theory.Effect.empty Theory.Effect.Sort.bot))
-
-type 'a comp_state = {
-  vars: unit Theory.Var.t Variables.t;
-  ign: Ignored.t;
-  kb: 'a KB.t;
-  throwErrors: bool;
-}
-
-let updateKB (state: 'a comp_state) (kb: 'a KB.t): 'a comp_state =
-  {
-    vars = state.vars;
-    ign = state.ign;
-    kb;
-    throwErrors = state.throwErrors;
+module State = struct
+  type t = {
+    vars: unit Theory.Var.t Variables.t;
+    ign: Ignored.t;
+    throwErrors: bool;
   }
 
-let updateVars (state: 'a comp_state) (vars: unit Theory.Var.t Variables.t): 'a comp_state =
-  {
-    vars;
-    ign = state.ign;
-    kb = state.kb;
-    throwErrors = state.throwErrors;
+  let empty = {
+    vars = Variables.empty;
+    ign = Ignored.empty;
+    throwErrors = false;
   }
+
+  let var = KB.Context.declare ~package:"bap" "asl-interpter-state"
+      !!empty
+
+  let get = KB.Context.get var
+  let set = KB.Context.set var
+  let update = KB.Context.update var
+
+  let updateVars upd =
+    let f st = 
+      let vars = upd st.vars in
+      let ign = st.ign in
+      let throwErrors = st.throwErrors in
+      { vars; ign; throwErrors }
+    in
+    update f
+
+  let updateIgn upd =
+    let f st = 
+      let vars = st.vars in
+      let ign = upd st.ign in
+      let throwErrors = st.throwErrors in
+      { vars; ign; throwErrors }
+    in
+    update f
+
+  let findVar name =
+    let+ st = get in
+    Variables.find name st.vars
+
+end
 
 let const_width = 256
 
@@ -65,8 +83,9 @@ let drop_chars (x: string) (c: char): string =
   (* create result *)
   String.init !len next_char
 
-let fail (errorType: KB.conflict) (throwErrors: bool) = 
-  if throwErrors then
+let fail (errorType: KB.conflict) = 
+  let* st = State.get in
+  if st.throwErrors then
     let typeString = match errorType with
       | Unknown_primop(m) -> "Unknown primitive operation: " ^ m
       | Unhandled_stmt(m) -> "Unhandled statement type: " ^ m
@@ -81,41 +100,41 @@ let fail (errorType: KB.conflict) (throwErrors: bool) =
   else
     KB.fail errorType
 
-let to_bits throwErrors e = e >>= fun ue -> 
+let to_bits e = e >>= fun ue -> 
   match Theory.Value.resort (fun x -> (Theory.Bitv.refine x)) ue with
   | Some x -> KB.return x
-  | None -> fail (Failed_conversion "Unable to convert value to bits") throwErrors
+  | None -> fail (Failed_conversion "Unable to convert value to bits") 
 
-let defined throwErrors e =
+let defined e =
   match e with
   | Some x -> KB.return x
-  | None -> fail (Failed_conversion "Unable to get option") throwErrors
+  | None -> fail (Failed_conversion "Unable to get option")
 
-let to_bool throwErrors e = e >>= fun ue ->
+let to_bool e = e >>= fun ue ->
   match Theory.Value.resort (fun x -> (Theory.Bool.refine x)) ue with
   | Some x -> KB.return x
-  | None -> fail (Failed_conversion "Unable to convert value to bool") throwErrors
+  | None -> fail (Failed_conversion "Unable to convert value to bool")
 
-let to_mem throwErrors e = e >>= fun ue ->
+let to_mem e = e >>= fun ue ->
   match Theory.Value.resort (fun x -> (Theory.Mem.refine x)) ue with
   | Some x -> KB.return x
-  | None -> fail (Failed_conversion "Unable to convert value to mem") throwErrors
+  | None -> fail (Failed_conversion "Unable to convert value to mem")
   
-let null = KB.Object.null Theory.Program.cls
 
 module Make(CT : Theory.Core) = struct
-  let get_var s (state: 'a comp_state) = 
-    match Variables.find_opt s state.vars with
-    | Some var -> CT.var var
-    | None -> fail (Unknown_variable s) state.throwErrors
-
-  let ign_var s (state: 'a comp_state) = 
-    Ignored.mem s state.ign
+  let ign_var s  = 
+    let+ st = State.get in
+    Ignored.mem s st.ign
 
   let rec seq = function
     | [] -> CT.perform Theory.Effect.Sort.bot
     | [x] -> x
-    | x :: xs -> CT.seq x @@ seq xs
+    | x :: xs ->
+      let* xs = seq xs in
+      let* x = x in
+      CT.seq (KB.return x) (KB.return xs)
+
+  let null = KB.Object.null Theory.Program.cls
 
   let ctrl eff =
     CT.blk null (seq []) eff
@@ -126,6 +145,12 @@ module Make(CT : Theory.Core) = struct
   let nop: unit Theory.eff =
     CT.blk null (seq []) (seq [])
 
+  let get_var s : unit Theory.Value.t KB.t = 
+    let* st = State.get in
+    match Variables.find_opt s st.vars with
+    | Some var -> CT.var var
+    | None -> fail (Unknown_variable s)
+
   let compile_int (e: Asl_ast.expr): int option =
     match e with
     | Expr_LitBits(s) -> 
@@ -135,12 +160,13 @@ module Make(CT : Theory.Core) = struct
       Some (Z.to_int (Z.of_string_base 10 s))
     | _ -> None
 
-  let rec compile_var (t: Asl_ast.ty) (ident: string) (value: Asl_ast.expr option) (state: 'a comp_state): 'a comp_state =
+  let rec compile_var (t: Asl_ast.ty) (ident: string) (value: Asl_ast.expr option): unit Theory.eff =
     let add_state t' = 
-      let var = Theory.Var.forget (Theory.Var.define t' ident) in
-      updateKB (updateVars state (Variables.add ident var state.vars)) (match value with
-      | Some v -> CT.seq state.kb (data (CT.set var (compile_expr v state)))
-      | None -> state.kb)
+      let* var = Theory.Var.fresh t' in
+      let* () = State.updateVars (Variables.add ident (Theory.Var.forget var)) in
+      (match value with
+      | Some v -> data (CT.set var (compile_expr v))
+      | None -> nop)
     in
     match t with
     | Type_Register (n, _)
@@ -149,44 +175,45 @@ module Make(CT : Theory.Core) = struct
     | Type_Constructor (Ident "boolean") ->
       add_state (Theory.Value.Sort.forget Theory.Bool.t)
     | _ ->
-      updateKB state (fail (Unhandled_type (Asl_utils.pp_type t)) state.throwErrors)
+      fail (Unhandled_type (Asl_utils.pp_type t))
 
-  and compile_expr (e: Asl_ast.expr) (state: 'a comp_state): unit Theory.Value.t KB.t =
+  and compile_expr (e: Asl_ast.expr): unit Theory.Value.t KB.t =
     match e with
     | Expr_Var(Ident ("_PC")) ->
-      fail (Unhandled_expr (Asl_utils.pp_expr e)) state.throwErrors
+      fail (Unhandled_expr (Asl_utils.pp_expr e))
     | Expr_Var(Ident ("FALSE")) -> CT.b0 >>| Theory.Value.forget
     | Expr_Var(Ident ("TRUE")) -> CT.b1 >>| Theory.Value.forget
     | Expr_Var(id) ->
         let i = (Asl_ast.pprint_ident id) in
-        if ign_var i state then
-          fail (Unknown_variable (Asl_utils.pp_expr e)) state.throwErrors
-        else get_var i state
+        let* ign = ign_var i in
+        if ign then
+          fail (Unknown_variable (Asl_utils.pp_expr e))
+        else get_var i 
     (* TODO: remove this and just use general case? *)
     | Expr_Slices(e, [Slice_LoWd(Expr_LitInt lo, Expr_LitInt wd)]) ->
-      let e' = compile_expr e state in
+      let e' = compile_expr e in
       let lo' = int_of_string lo in
       let wd' = int_of_string wd in
       let hi = lo' + wd' - 1 in
       let s = Theory.Bitv.define wd' in
       let (module MX) = Bitvec.modular const_width in
       let const x = CT.int (Theory.Bitv.define const_width) (MX.int x) in
-      (CT.extract s (const hi) (const lo') (to_bits state.throwErrors e')) >>| Theory.Value.forget
+      (CT.extract s (const hi) (const lo') (to_bits e')) >>| Theory.Value.forget
     | Expr_Slices(e, [Slice_LoWd(lo, wd)]) ->
-      let e' = compile_expr e state in
-      let lo' = compile_expr lo state |> to_bits state.throwErrors in
-      let wd' = compile_expr wd state |> to_bits state.throwErrors in
+      let e' = compile_expr e in
+      let lo' = compile_expr lo |> to_bits  in
+      let wd' = compile_expr wd |> to_bits  in
       let (module MX) = Bitvec.modular const_width in
       let const x = CT.int (Theory.Bitv.define const_width) (MX.int x) in
       let hi = CT.add (CT.add lo' wd') (const (-1)) in
       let* s = wd' >>| Theory.Value.sort in
-      (CT.extract s hi lo' (to_bits state.throwErrors e')) >>| Theory.Value.forget
+      (CT.extract s hi lo' (to_bits e')) >>| Theory.Value.forget
     | Expr_Array(Expr_Var(Ident "_R"), Expr_LitInt(s)) ->
-      get_var ("R" ^ s) state
+      get_var ("R" ^ s)
     | Expr_Array(Expr_Var(Ident "_Z"), Expr_LitInt(s)) ->
-      get_var ("V" ^ s) state
+      get_var ("V" ^ s)
     | Expr_TApply(FIdent("replicate_bits", _), _, [e; Expr_LitInt(n)]) ->
-      let e' = compile_expr e state |> to_bits state.throwErrors in
+      let e' = compile_expr e |> to_bits in
       let n' = int_of_string n in
       let* v = e' in
       let en = Theory.Bitv.size (Theory.Value.sort v) in
@@ -194,24 +221,24 @@ module Make(CT : Theory.Core) = struct
         CT.append (Theory.Bitv.define (en * i)) acc (KB.return v)
       ) (KB.return v) (List.init (n' - 1) (fun x -> x + 2)) >>| Theory.Value.forget
     | Expr_TApply(FIdent("eq_enum", _), _, [e1; e2]) ->
-      let e1' = compile_expr e1 state |> to_bool state.throwErrors in
-      let e2' = compile_expr e2 state |> to_bool state.throwErrors in
+      let e1' = compile_expr e1 |> to_bool in
+      let e2' = compile_expr e2 |> to_bool in
       (* TODO: figure out a less hacky way to do eq *)
       CT.or_ (CT.and_ e1' e2') (CT.and_ (CT.inv e1') (CT.inv e2')) >>| Theory.Value.forget
     | Expr_TApply(f, [], [e1; e2]) ->
-      let e1' = compile_expr e1 state |> to_bool state.throwErrors in
-      let e2' = compile_expr e2 state |> to_bool state.throwErrors in
+      let e1' = compile_expr e1 |> to_bool in
+      let e2' = compile_expr e2 |> to_bool in
       (match Asl_ast.name_of_FIdent f with
       | "or_bool" ->
         CT.or_ e1' e2' >>| Theory.Value.forget
       | "and_bool" ->
         CT.and_ e1' e2' >>| Theory.Value.forget
       | n ->
-        fail (Unknown_primop n) state.throwErrors
+        fail (Unknown_primop n)
       ) 
     | Expr_TApply(f, targs, [e1; e2]) ->
-      let e1' = compile_expr e1 state |> to_bits state.throwErrors in
-      let e2' = compile_expr e2 state |> to_bits state.throwErrors in
+      let e1' = compile_expr e1 |> to_bits in
+      let e2' = compile_expr e2 |> to_bits in
       let* v1 = e1' in
       let* v2 = e2' in
       let n1 = Theory.Bitv.size (Theory.Value.sort v1) in
@@ -252,66 +279,65 @@ module Make(CT : Theory.Core) = struct
           | [_;  Expr_LitInt(n)] ->
               let n' = int_of_string n in
               CT.unsigned (Theory.Bitv.define n') e1' >>| Theory.Value.forget
-          | _ -> fail (Unknown_primop "ZeroExtend") state.throwErrors)
+          | _ -> fail (Unknown_primop "ZeroExtend"))
       | "SignExtend" ->
           (match targs with
           | [_;  Expr_LitInt(n)] ->
               let n' = int_of_string n in
               CT.signed (Theory.Bitv.define n') e1' >>| Theory.Value.forget
-          | _ -> fail (Unknown_primop "SignExtend") state.throwErrors)
+          | _ -> fail (Unknown_primop "SignExtend"))
       (* TODO: implement round_tozero_real for aarch64_integer_arithmetic_div *)
       | n ->
-        fail (Unknown_primop n) state.throwErrors
+        fail (Unknown_primop n)
       )
     | Expr_TApply(f, _, [e]) ->
-      let eUnsorted = compile_expr e state in
-      let e' = eUnsorted |> to_bits  state.throwErrors in
+      let eUnsorted = compile_expr e in
+      let e' = eUnsorted |> to_bits in
       (match Asl_ast.name_of_FIdent f with
       | "not_bits" ->
         CT.not e' >>| Theory.Value.forget
       | "not_bool" ->
-        let eBool = eUnsorted |> to_bool state.throwErrors in
+        let eBool = eUnsorted |> to_bool in
         CT.inv eBool >>| Theory.Value.forget
       | "cvt_bool_bv" ->
         let s = Theory.Bitv.define 1 in
         let (module MX) = Bitvec.modular 1 in
         let const x = CT.int (s) (MX.int x) in
-
-        let eBool = eUnsorted |> to_bool state.throwErrors in
+        let eBool = eUnsorted |> to_bool in
         (CT.ite eBool (const 1) (const 0)) >>| Theory.Value.forget
       | "ZeroExtend" ->
         (* TODO: at the moment relying on implicit extension, may need to do it explicitly *)
         e' >>| Theory.Value.forget
       | n ->
-        fail (Unknown_primop n) state.throwErrors
+        fail (Unknown_primop n)
       )
     | Expr_TApply(FIdent("Mem.read", 0), _, [e1; e2; e3]) ->
-      let e1' = compile_expr e1 state |> to_bits state.throwErrors in
-      let* s = defined state.throwErrors (compile_int e2) in
-      let mem = get_var "mem" state |> to_mem state.throwErrors in
+      let e1' = compile_expr e1 |> to_bits in
+      let* s = defined (compile_int e2) in
+      let mem = get_var "mem" |> to_mem in
       CT.loadw (Theory.Bitv.define (s * 8)) CT.b0 mem e1' >>| Theory.Value.forget
     | Expr_Parens(e) ->
-      compile_expr e state
+      compile_expr e 
     | Expr_Field(Expr_Var(Ident "PSTATE"), Ident f) -> 
-      get_var (f ^ "F") state
+      get_var (f ^ "F") 
     | Expr_LitBits(s) -> 
       let x' = drop_chars s ' ' in 
       CT.int (Theory.Bitv.define (String.length x')) (Bitvec.bigint_unsafe (Z.of_string_base 2 x')) >>| Theory.Value.forget
     | Expr_LitInt(s) ->
       CT.int (Theory.Bitv.define 64) (Bitvec.bigint_unsafe (Z.of_string_base 10 s)) >>| Theory.Value.forget
     | _ ->
-      fail (Unhandled_expr (Asl_utils.pp_expr e)) state.throwErrors
+      fail (Unhandled_expr (Asl_utils.pp_expr e))
 
-  and compile_stmt (s: Asl_ast.stmt) (state: 'a comp_state): ('a comp_state) =
+  and compile_stmt (s: Asl_ast.stmt): unit Theory.eff =
     match s with
     | Stmt_VarDeclsNoInit(ty, vs, loc) ->
-      List.fold_left (fun state' v -> compile_var ty (Asl_ast.pprint_ident v) None state') state vs
+        seq (List.map (fun v -> compile_var ty (Asl_ast.pprint_ident v) None) vs)
     | Stmt_VarDecl(ty, v, i, loc) ->
-      compile_var ty (Asl_ast.pprint_ident v) (Some i) state
+        compile_var ty (Asl_ast.pprint_ident v) (Some i) 
     | Stmt_ConstDecl(ty, v, i, loc) ->
-      compile_var ty (Asl_ast.pprint_ident v) (Some i) state
+        compile_var ty (Asl_ast.pprint_ident v) (Some i)
     | Stmt_Assign(LExpr_Var(Ident("_PC")), r, _) ->
-        let kb =  (match r with
+        (match r with
         | Expr_LitBits(s) -> 
             let x' = drop_chars s ' ' in 
             let d = Bitvec.bigint_unsafe (Z.of_string_base 2 x') in
@@ -320,68 +346,68 @@ module Make(CT : Theory.Core) = struct
             let d = Bitvec.bigint_unsafe (Z.of_string_base 10 s) in
             ctrl @@ (Theory.Label.for_addr d >>= fun dst -> CT.goto dst)
         | _ -> 
-          let r' = compile_expr r state in
-          let dst = r' |> to_bits state.throwErrors in
-          ctrl @@ CT.jmp dst) in
-      updateKB state (CT.seq state.kb kb)
+          let r' = compile_expr r in
+          let dst = r' |> to_bits in
+          ctrl @@ CT.jmp dst)
     | Stmt_Assign(l, r, _) ->
-      let r' = compile_expr r state in
-      let kb = (match l with
+      let r' = compile_expr r in
+      (match l with
       | LExpr_Write(FIdent(i, n), tes, es) ->
-        data @@ CT.set (Variables.find ("R" ^ string_of_int n) state.vars) r'
+          let* v = State.findVar ("R" ^ string_of_int n) in
+          data @@ CT.set v r'
       | LExpr_Array(LExpr_Var(Ident "_R"), Expr_LitInt(s)) ->
-        data @@ CT.set (Variables.find ("R" ^ s) state.vars) r'
+          let* v = State.findVar ("R" ^ s) in
+          data @@ CT.set v r'
       | LExpr_Array(LExpr_Var(Ident "_Z"), Expr_LitInt(s)) ->
-        data @@ CT.set (Variables.find ("V" ^ s) state.vars) r'
+          let* v = State.findVar ("V" ^ s) in
+          data @@ CT.set v r'
       | LExpr_Var(Ident(i)) ->
+        let* state = State.get in
         (match Variables.find_opt i state.vars with
         | Some var -> data @@ CT.set var r'
         | None -> 
-            if ign_var i state then nop
-            else fail (Unknown_variable i) state.throwErrors
+            let* ign = ign_var i in
+            if ign then nop
+            else fail (Unknown_variable i)
         )
       | LExpr_Field(LExpr_Var(Ident "PSTATE"), Ident f) ->
           let i = f ^ "F" in
-          if ign_var i state then nop
-          else data @@ CT.set (Variables.find (f ^ "F") state.vars) r'
+          let* ign = ign_var i in
+          if ign then nop
+          else let* v = State.findVar (f ^ "F") in data @@ CT.set v r'
       | _ ->
-        fail (Unhandled_lexpr (Asl_utils.pp_lexpr l)) state.throwErrors
-      ) in
-      updateKB state (CT.seq state.kb kb)
+        fail (Unhandled_lexpr (Asl_utils.pp_lexpr l))
+      )
     | Stmt_If(c, t, els, e, loc) ->
       let rec do_if xs e = (match xs with
-        | [] -> compile_stmts e (updateKB state emptyKB)
+        | [] -> compile_stmts e 
         | Asl_ast.S_Elsif_Cond (cond, b)::xs' -> 
-          let cond' = compile_expr cond state in
-          let cond'' = to_bool state.throwErrors cond' in
-          let b' = compile_stmts b (updateKB state emptyKB) in
+          let cond' = compile_expr cond in
+          let cond'' = to_bool  cond' in
+          let b' = compile_stmts b in
           let rest = do_if xs' e in
           CT.branch cond'' b' rest
       ) in
-      updateKB state (CT.seq state.kb (do_if (Asl_ast.S_Elsif_Cond(c, t)::els) e))
+      (do_if (Asl_ast.S_Elsif_Cond(c, t)::els) e)
     | Stmt_TCall(FIdent("Mem.set", 0), _, [addr; size; _; value], _) ->
-      let addr' = compile_expr addr state |> to_bits state.throwErrors in
-      let value' = compile_expr value state |> to_bits state.throwErrors in
-      let memVar = Variables.find "mem" state.vars in
-      let mem = get_var "mem" state |> to_mem state.throwErrors in
-
-      (*let newMem' = CT.store mem addr' value' >>| Theory.Value.forget in*)
+      let* memVar = State.findVar "mem" in
+      let addr' = compile_expr addr |> to_bits in
+      let value' = compile_expr value |> to_bits in
+      let mem = get_var "mem" |> to_mem in
       let newMem = CT.storew CT.b0 mem addr' value' >>| Theory.Value.forget in
-
-      let kb = data @@ CT.set memVar newMem in
-      updateKB state (CT.seq state.kb kb)
+      data @@ CT.set memVar newMem 
     | Stmt_Assert(_, _) ->
       (* TODO: perform some kind of intrinsic call *)
-      state
+      nop
     | Stmt_Throw(_, _) ->
       (* TODO: perform some kind of intrinsic call *)
-      state
+      nop
     | _ ->
-      updateKB state (CT.seq state.kb (fail (Unhandled_stmt (Asl_utils.pp_stmt s)) state.throwErrors))
+      fail (Unhandled_stmt (Asl_utils.pp_stmt s))
   
-  and compile_stmts (stmts: Asl_ast.stmt list) (state: 'a comp_state) =
-    (List.fold_left (fun state' stmt -> compile_stmt stmt state') state stmts).kb
-    
+  and compile_stmts (stmts: Asl_ast.stmt list): unit Theory.eff  =
+    seq (List.map compile_stmt stmts)
+   
   let initialize_vars =
     (* 64-bit registers *)
     List.fold_left (fun vars var -> 
@@ -411,6 +437,12 @@ module Make(CT : Theory.Core) = struct
     Ignored.add "BTypeCompatible" |>
     Ignored.add "BTypeNext"
 
+  let run p stmts =
+    let* () = State.updateVars (fun _ -> initialize_vars) in
+    let* () = State.updateIgn (fun _ -> initialize_ign) in
+    let c = compile_stmts stmts in
+    CT.seq p c
+
 end
 
 let lifter env throwErrors label =
@@ -418,23 +450,21 @@ let lifter env throwErrors label =
   let* addr = label-->?Theory.Label.addr in
   let* (module CT) = Theory.current in
   let module Cmplr = Make(CT) in
-  let vars = Cmplr.initialize_vars in
-  let ign = Cmplr.initialize_ign in
-  let (d, opcount) = Memory.fold ~word_size:Size.r32 mem ~init:(emptyKB, 0) ~f:(fun w (kb, opcount) ->
+  let (kb, opcount) = Memory.fold ~word_size:Size.r32 mem ~init:(Cmplr.nop,0) ~f:(fun w (kb,opcount) ->
     let str = Bitvec.to_string (Bitvector.to_bitvec w) in
     let address = Some (Bitvec.to_string addr) in
-    try (let stmts = (Dis.retrieveDisassembly ?address env str) in (Cmplr.compile_stmts stmts { vars; ign; kb; throwErrors }), opcount + 1)
+    try 
+      (Cmplr.run kb (Dis.retrieveDisassembly ?address env str), opcount + 1)
     with 
     | Error(s) -> Printf.printf "%s had BAP error: %s\n" str s; (kb, opcount + 1)
     | exn -> 
       let error = String.trim (Printexc.to_string exn) in
       let backtrace = Printexc.get_backtrace () in
       let firstbacktrace = List.hd (String.split_on_char '\n' backtrace) in
-      Printf.printf "%s had ASL error: %s, %s\n" str error firstbacktrace; (kb, opcount + 1)
+      Printf.printf "%s had ASL error: %s, %s\n" str error firstbacktrace; (kb,opcount + 1)
   ) in
-  if throwErrors then Printf.eprintf "%d\n" opcount;
-  let* i = d in
-  let* m = (CT.blk null (CT.perform Theory.Effect.Sort.bot) (CT.perform Theory.Effect.Sort.bot)) in
+  let* i = kb in
+  let* m = Cmplr.nop in
   KB.collect Disasm_expert.Basic.Insn.slot label >>| function
   | Some basic when Insn.(i <> empty) ->
       Insn.with_basic i basic
