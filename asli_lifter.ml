@@ -30,7 +30,7 @@ module State = struct
   let empty = {
     vars = Variables.empty;
     ign = Ignored.empty;
-    throwErrors = false;
+    throwErrors = true;
   }
 
   let var = KB.Context.declare ~package:"bap" "asl-interpter-state"
