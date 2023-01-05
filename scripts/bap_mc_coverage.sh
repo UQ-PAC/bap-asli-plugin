@@ -3,7 +3,7 @@
 # Requires ASLI_PATH to point to your asl-interpreter checkout.
 
 if [ $# != 1 ] && [ $# != 3 ]
-then 
+then
 	echo "Usage: $0 instruction [in] [out]"
   echo "e.g. $0 aarch64_integer_arithmetic_add_sub_carry result.txt errors.txt"
 	exit 1
@@ -13,6 +13,9 @@ if [[ -z "${ASLI_PATH}" ]]; then
   echo "Set environment variable ASLI_PATH to the asl-interpreter checkout"
   exit 1
 fi
+
+eval $(opam env)
+export DYLD_LIBRARY_PATH=$(opam var z3:lib)
 
 # Get all the opcodes for the given instruction
 OPCODES=$(echo ":opcodes A64 $1" | \

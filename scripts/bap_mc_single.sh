@@ -1,9 +1,9 @@
 #!/bin/bash
-# Lift a given stream of bytes. 
+# Lift a given stream of bytes.
 # Requires ASLI_PATH to point to your asl-interpreter checkout.
 
 if [ $# != 1 ]
-then 
+then
 	echo "Usage: $0 <bytes>"
   echo "e.g. $0 \"20 00 02 8b\""
 	exit 1
@@ -13,6 +13,9 @@ if [[ -z "${ASLI_PATH}" ]]; then
   echo "Set environment variable ASLI_PATH to the asl-interpreter checkout"
   exit 1
 fi
+
+eval $(opam env)
+export DYLD_LIBRARY_PATH=$(opam var z3:lib)
 
 bap-mc --show-bir --arch=aarch64 \
 --primus-lisp-semantics=disable \

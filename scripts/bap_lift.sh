@@ -15,8 +15,11 @@ if [[ -z "${ASLI_PATH}" ]]; then
   exit 1
 fi
 
+eval $(opam env)
+export DYLD_LIBRARY_PATH=$(opam var z3:lib)
+
 bap $@ --primus-lisp-semantics=disable \
---asli-prelude=$ASLI_PATH/asl-interpreter/prelude.asl \
+--asli-prelude=$ASLI_PATH/prelude.asl \
 --asli-specs=$ASLI_PATH/mra_tools/arch/regs.asl \
 --asli-specs=$ASLI_PATH/mra_tools/types.asl \
 --asli-specs=$ASLI_PATH/mra_tools/arch/arch.asl \
