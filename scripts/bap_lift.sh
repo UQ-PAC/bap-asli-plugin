@@ -1,11 +1,12 @@
 #!/bin/bash
-# Lift a given stream of bytes. 
+
+# Lift an aarch64 binary.
 # Requires ASLI_PATH to point to your asl-interpreter checkout.
 
-if [ $# != 1 ]
-then 
-	echo "Usage: $0 <bytes>"
-  echo "e.g. $0 \"20 00 02 8b\""
+if [ $# == 0 ]
+then
+	echo "Usage: $0 <bap-args>"
+  echo "e.g. $0 bin -d bir:output.bir"
 	exit 1
 fi
 
@@ -14,9 +15,8 @@ if [[ -z "${ASLI_PATH}" ]]; then
   exit 1
 fi
 
-bap-mc --show-bir --arch=aarch64 \
---primus-lisp-semantics=disable \
---asli-prelude=$ASLI_PATH/prelude.asl \
+bap $@ --primus-lisp-semantics=disable \
+--asli-prelude=$ASLI_PATH/asl-interpreter/prelude.asl \
 --asli-specs=$ASLI_PATH/mra_tools/arch/regs.asl \
 --asli-specs=$ASLI_PATH/mra_tools/types.asl \
 --asli-specs=$ASLI_PATH/mra_tools/arch/arch.asl \
@@ -30,5 +30,4 @@ bap-mc --show-bir --arch=aarch64 \
 --asli-specs=$ASLI_PATH/mra_tools/support/interrupts.asl \
 --asli-specs=$ASLI_PATH/mra_tools/support/memory.asl \
 --asli-specs=$ASLI_PATH/mra_tools/support/stubs.asl \
---asli-specs=$ASLI_PATH/tests/override.asl \
--- $1
+--asli-specs=$ASLI_PATH/tests/override.asl
