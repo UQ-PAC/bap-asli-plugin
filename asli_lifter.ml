@@ -25,12 +25,14 @@ module State = struct
     vars: unit Theory.Var.t Variables.t;
     ign: Ignored.t;
     throwErrors: bool;
+    inst: string;
   }
 
   let empty = {
     vars = Variables.empty;
     ign = Ignored.empty;
     throwErrors = true;
+    inst = "";
   }
 
   let var = KB.Context.declare ~package:"bap" "asl-interpter-state"
@@ -45,7 +47,8 @@ module State = struct
       let vars = upd st.vars in
       let ign = st.ign in
       let throwErrors = st.throwErrors in
-      { vars; ign; throwErrors }
+      let inst = st.inst in
+      { vars; ign; throwErrors; inst }
     in
     update f
 
@@ -54,13 +57,23 @@ module State = struct
       let vars = st.vars in
       let ign = upd st.ign in
       let throwErrors = st.throwErrors in
-      { vars; ign; throwErrors }
+      let inst = st.inst in
+      { vars; ign; throwErrors; inst}
     in
     update f
 
   let findVar name =
     let+ st = get in
     Variables.find name st.vars
+
+  let setInst inst =
+    let f st = 
+      let vars = st.vars in
+      let ign = st.ign in
+      let throwErrors = st.throwErrors in
+      { vars; ign; throwErrors; inst}
+    in
+    update f
 
 end
 
@@ -87,13 +100,13 @@ let fail (errorType: KB.conflict) =
   let* st = State.get in
   if st.throwErrors then
     let typeString = match errorType with
-      | Unknown_primop(m) -> "Unknown primitive operation: " ^ m
-      | Unhandled_stmt(m) -> "Unhandled statement type: " ^ m
-      | Unhandled_expr(m) -> "Unhandled expression: " ^ m
-      | Unhandled_lexpr(m) -> "Unhandled Lexpression: " ^ m
-      | Unhandled_type(m) -> "Unhandled type: " ^ m
-      | Failed_conversion(m) -> "Failed conversion: " ^ m
-      | Unknown_variable(m) -> "Unknown variable: " ^ m
+      | Unknown_primop(m)    -> st.inst ^ ": Unknown primitive operation: " ^ m
+      | Unhandled_stmt(m)    -> st.inst ^ ": Unhandled statement type: " ^ m
+      | Unhandled_expr(m)    -> st.inst ^ ": Unhandled expression: " ^ m
+      | Unhandled_lexpr(m)   -> st.inst ^ ": Unhandled Lexpression: " ^ m
+      | Unhandled_type(m)    -> st.inst ^ ": Unhandled type: " ^ m
+      | Failed_conversion(m) -> st.inst ^ ": Failed conversion: " ^ m
+      | Unknown_variable(m)  -> st.inst ^ ": Unknown variable: " ^ m
       | _ -> "Unknown error"
     in 
     raise (Error typeString)
@@ -130,8 +143,8 @@ module Make(CT : Theory.Core) = struct
     | [] -> CT.perform Theory.Effect.Sort.bot
     | [x] -> x
     | x :: xs ->
-      let* xs = seq xs in
       let* x = x in
+      let* xs = seq xs in
       CT.seq (KB.return x) (KB.return xs)
 
   let null = KB.Object.null Theory.Program.cls
@@ -145,20 +158,24 @@ module Make(CT : Theory.Core) = struct
   let nop: unit Theory.eff =
     CT.blk null (seq []) (seq [])
 
+  let const x = 
+    let (module MX) = Bitvec.modular const_width in
+    CT.int (Theory.Bitv.define const_width) (MX.int x)
+
   let get_var s : unit Theory.Value.t KB.t = 
     let* st = State.get in
     match Variables.find_opt s st.vars with
     | Some var -> CT.var var
     | None -> fail (Unknown_variable s)
 
-  let compile_int (e: Asl_ast.expr): int option =
+  let force_int (e: Asl_ast.expr): int KB.t =
     match e with
     | Expr_LitBits(s) -> 
-      let x' = drop_chars s ' ' in 
-      Some (Z.to_int (Z.of_string_base 2 x'))
+        let x' = drop_chars s ' ' in 
+        KB.return (Z.to_int (Z.of_string_base 2 x'))
     | Expr_LitInt(s) ->
-      Some (Z.to_int (Z.of_string_base 10 s))
-    | _ -> None
+        KB.return (Z.to_int (Z.of_string_base 10 s))
+    | _ -> fail (Failed_conversion "Unable to get option")
 
   let rec compile_var (t: Asl_ast.ty) (ident: string) (value: Asl_ast.expr option): unit Theory.eff =
     let add_state t' = 
@@ -171,162 +188,133 @@ module Make(CT : Theory.Core) = struct
     match t with
     | Type_Register (n, _)
     | Type_Bits (Expr_LitInt n) ->
-      add_state (Theory.Value.Sort.forget (Theory.Bitv.define (int_of_string n)))
+        add_state (Theory.Value.Sort.forget (Theory.Bitv.define (int_of_string n)))
     | Type_Constructor (Ident "boolean") ->
-      add_state (Theory.Value.Sort.forget Theory.Bool.t)
-    | _ ->
-      fail (Unhandled_type (Asl_utils.pp_type t))
+        add_state (Theory.Value.Sort.forget Theory.Bool.t)
+    | _ -> fail (Unhandled_type (Asl_utils.pp_type t))
 
   and compile_expr (e: Asl_ast.expr): unit Theory.Value.t KB.t =
     match e with
-    | Expr_Var(Ident ("_PC")) ->
-      fail (Unhandled_expr (Asl_utils.pp_expr e))
-    | Expr_Var(Ident ("FALSE")) -> CT.b0 >>| Theory.Value.forget
-    | Expr_Var(Ident ("TRUE")) -> CT.b1 >>| Theory.Value.forget
-    | Expr_Var(id) ->
-        let i = (Asl_ast.pprint_ident id) in
-        let* ign = ign_var i in
-        if ign then
-          fail (Unknown_variable (Asl_utils.pp_expr e))
-        else get_var i 
-    (* TODO: remove this and just use general case? *)
-    | Expr_Slices(e, [Slice_LoWd(Expr_LitInt lo, Expr_LitInt wd)]) ->
-      let e' = compile_expr e in
-      let lo' = int_of_string lo in
-      let wd' = int_of_string wd in
-      let hi = lo' + wd' - 1 in
-      let s = Theory.Bitv.define wd' in
-      let (module MX) = Bitvec.modular const_width in
-      let const x = CT.int (Theory.Bitv.define const_width) (MX.int x) in
-      (CT.extract s (const hi) (const lo') (to_bits e')) >>| Theory.Value.forget
-    | Expr_Slices(e, [Slice_LoWd(lo, wd)]) ->
-      let e' = compile_expr e in
-      let lo' = compile_expr lo |> to_bits  in
-      let wd' = compile_expr wd |> to_bits  in
-      let (module MX) = Bitvec.modular const_width in
-      let const x = CT.int (Theory.Bitv.define const_width) (MX.int x) in
-      let hi = CT.add (CT.add lo' wd') (const (-1)) in
-      let* s = wd' >>| Theory.Value.sort in
-      (CT.extract s hi lo' (to_bits e')) >>| Theory.Value.forget
-    | Expr_Array(Expr_Var(Ident "_R"), Expr_LitInt(s)) ->
-      get_var ("R" ^ s)
-    | Expr_Array(Expr_Var(Ident "_Z"), Expr_LitInt(s)) ->
-      get_var ("V" ^ s)
-    | Expr_TApply(FIdent("replicate_bits", _), _, [e; Expr_LitInt(n)]) ->
-      let e' = compile_expr e |> to_bits in
-      let n' = int_of_string n in
-      let* v = e' in
-      let en = Theory.Bitv.size (Theory.Value.sort v) in
-      List.fold_left (fun acc i -> 
-        CT.append (Theory.Bitv.define (en * i)) acc (KB.return v)
-      ) (KB.return v) (List.init (n' - 1) (fun x -> x + 2)) >>| Theory.Value.forget
-    | Expr_TApply(FIdent("eq_enum", _), _, [e1; e2]) ->
-      let e1' = compile_expr e1 |> to_bool in
-      let e2' = compile_expr e2 |> to_bool in
-      (* TODO: figure out a less hacky way to do eq *)
-      CT.or_ (CT.and_ e1' e2') (CT.and_ (CT.inv e1') (CT.inv e2')) >>| Theory.Value.forget
-    | Expr_TApply(f, [], [e1; e2]) ->
-      let e1' = compile_expr e1 |> to_bool in
-      let e2' = compile_expr e2 |> to_bool in
-      (match Asl_ast.name_of_FIdent f with
-      | "or_bool" ->
-        CT.or_ e1' e2' >>| Theory.Value.forget
-      | "and_bool" ->
-        CT.and_ e1' e2' >>| Theory.Value.forget
-      | n ->
-        fail (Unknown_primop n)
-      ) 
-    | Expr_TApply(f, targs, [e1; e2]) ->
-      let e1' = compile_expr e1 |> to_bits in
-      let e2' = compile_expr e2 |> to_bits in
-      let* v1 = e1' in
-      let* v2 = e2' in
-      let n1 = Theory.Bitv.size (Theory.Value.sort v1) in
-      let n2 = Theory.Bitv.size (Theory.Value.sort v2) in
-      let e1' = KB.return v1 in
-      let e2' = KB.return v2 in
-      (match Asl_ast.name_of_FIdent f with
-      | "or_bits" ->
-        CT.logor e1' e2' >>| Theory.Value.forget
-      | "and_bits" ->
-        CT.logand e1' e2' >>| Theory.Value.forget
-      | "eor_bits" ->
-        CT.logxor e1' e2' >>| Theory.Value.forget
-      | "eq_bits" ->
-        CT.eq e1' e2' >>| Theory.Value.forget
-      | "add_bits" ->
-        CT.add e1' e2' >>| Theory.Value.forget
-      | "sub_bits" ->
-        CT.sub e1' e2' >>| Theory.Value.forget
-      | "mul_bits" ->
-        CT.mul e1' e2' >>| Theory.Value.forget
-      | "sdiv_bits" ->
-        CT.sdiv e1' e2' >>| Theory.Value.forget
-      | "lsl_bits" ->
-        CT.lshift e1' e2' >>| Theory.Value.forget
-      | "lsr_bits" ->
-        CT.rshift e1' e2' >>| Theory.Value.forget
-      | "asr_bits" ->
-        CT.arshift e1' e2' >>| Theory.Value.forget
-      | "slt_bits" ->
-        CT.slt e1' e2' >>| Theory.Value.forget
-      | "sle_bits" ->
-        CT.sle e1' e2' >>| Theory.Value.forget
-      | "append_bits" ->
-       CT.append (Theory.Bitv.define (n1 + n2)) (KB.return v1) (KB.return v2) >>| Theory.Value.forget
-      | "ZeroExtend" ->
-          (match targs with
-          | [_;  Expr_LitInt(n)] ->
-              let n' = int_of_string n in
-              CT.unsigned (Theory.Bitv.define n') e1' >>| Theory.Value.forget
-          | _ -> fail (Unknown_primop "ZeroExtend"))
-      | "SignExtend" ->
-          (match targs with
-          | [_;  Expr_LitInt(n)] ->
-              let n' = int_of_string n in
-              CT.signed (Theory.Bitv.define n') e1' >>| Theory.Value.forget
-          | _ -> fail (Unknown_primop "SignExtend"))
-      (* TODO: implement round_tozero_real for aarch64_integer_arithmetic_div *)
-      | n ->
-        fail (Unknown_primop n)
-      )
-    | Expr_TApply(f, _, [e]) ->
-      let eUnsorted = compile_expr e in
-      let e' = eUnsorted |> to_bits in
-      (match Asl_ast.name_of_FIdent f with
-      | "not_bits" ->
-        CT.not e' >>| Theory.Value.forget
-      | "not_bool" ->
-        let eBool = eUnsorted |> to_bool in
-        CT.inv eBool >>| Theory.Value.forget
-      | "cvt_bool_bv" ->
-        let s = Theory.Bitv.define 1 in
-        let (module MX) = Bitvec.modular 1 in
-        let const x = CT.int (s) (MX.int x) in
-        let eBool = eUnsorted |> to_bool in
-        (CT.ite eBool (const 1) (const 0)) >>| Theory.Value.forget
-      | "ZeroExtend" ->
-        (* TODO: at the moment relying on implicit extension, may need to do it explicitly *)
-        e' >>| Theory.Value.forget
-      | n ->
-        fail (Unknown_primop n)
-      )
-    | Expr_TApply(FIdent("Mem.read", 0), _, [e1; e2; e3]) ->
-      let e1' = compile_expr e1 |> to_bits in
-      let* s = defined (compile_int e2) in
-      let mem = get_var "mem" |> to_mem in
-      CT.loadw (Theory.Bitv.define (s * 8)) CT.b0 mem e1' >>| Theory.Value.forget
-    | Expr_Parens(e) ->
-      compile_expr e 
-    | Expr_Field(Expr_Var(Ident "PSTATE"), Ident f) -> 
-      get_var (f ^ "F") 
+    (* Constants *)
+    | Expr_Var(Ident ("FALSE")) ->
+        CT.b0 >>| Theory.Value.forget
+    | Expr_Var(Ident ("TRUE")) ->
+        CT.b1 >>| Theory.Value.forget
     | Expr_LitBits(s) -> 
-      let x' = drop_chars s ' ' in 
-      CT.int (Theory.Bitv.define (String.length x')) (Bitvec.bigint_unsafe (Z.of_string_base 2 x')) >>| Theory.Value.forget
+        let x' = drop_chars s ' ' in 
+        CT.int (Theory.Bitv.define (String.length x')) (Bitvec.bigint_unsafe (Z.of_string_base 2 x')) >>| Theory.Value.forget
     | Expr_LitInt(s) ->
-      CT.int (Theory.Bitv.define 64) (Bitvec.bigint_unsafe (Z.of_string_base 10 s)) >>| Theory.Value.forget
-    | _ ->
-      fail (Unhandled_expr (Asl_utils.pp_expr e))
+        CT.int (Theory.Bitv.define 64) (Bitvec.bigint_unsafe (Z.of_string_base 10 s)) >>| Theory.Value.forget
+
+    (* Variables *)
+    | Expr_Var(Ident ("_PC")) ->
+        fail (Unhandled_expr (Asl_utils.pp_expr e))
+    | Expr_Array(Expr_Var(Ident "_R"), Expr_LitInt(s)) ->
+        get_var ("R" ^ s)
+    | Expr_Array(Expr_Var(Ident "_Z"), Expr_LitInt(s)) ->
+        get_var ("V" ^ s)
+    | Expr_Var(id) ->
+        let i = Asl_ast.pprint_ident id in
+        let* ign = ign_var i in
+        if ign then fail (Unknown_variable (Asl_utils.pp_expr e))
+        else get_var i 
+    | Expr_TApply(FIdent("Mem.read", 0), _, [e1; e2; e3]) ->
+        let* s = force_int e2 in
+        let e1' = compile_expr e1 |> to_bits in
+        let mem = get_var "mem" |> to_mem in
+        CT.loadw (Theory.Bitv.define (s * 8)) CT.b0 mem e1' >>| Theory.Value.forget
+    | Expr_Field(Expr_Var(Ident "PSTATE"), Ident f) -> 
+        get_var (f ^ "F") 
+
+    (* Boolean Expressions *)
+    | Expr_TApply(f, [], [e1]) ->
+        let e1' = compile_expr e1 |> to_bool in
+        (match Asl_ast.name_of_FIdent f with
+        | "not_bool" -> CT.inv e1' >>| Theory.Value.forget
+        | "cvt_bool_bv" ->
+            let s = Theory.Bitv.define 1 in
+            let (module MX) = Bitvec.modular 1 in
+            let const x = CT.int (s) (MX.int x) in
+            (CT.ite e1' (const 1) (const 0)) >>| Theory.Value.forget
+        | n -> fail (Unknown_primop n)) 
+    | Expr_TApply(f, [], [e1; e2]) ->
+        let e1' = compile_expr e1 |> to_bool in
+        let e2' = compile_expr e2 |> to_bool in
+        (match Asl_ast.name_of_FIdent f with
+        | "eq_enum" -> 
+            CT.or_ (CT.and_ e1' e2') (CT.and_ (CT.inv e1') (CT.inv e2')) >>| Theory.Value.forget
+        | "or_bool" -> CT.or_ e1' e2' >>| Theory.Value.forget
+        | "and_bool" -> CT.and_ e1' e2' >>| Theory.Value.forget
+        | n -> fail (Unknown_primop n)) 
+
+    (* Bitvector Expressions *)
+    | Expr_Slices(e, [Slice_LoWd(lo, wd)]) ->
+        let e' = compile_expr e in
+        let lo' = compile_expr lo |> to_bits in
+        let wd' = compile_expr wd |> to_bits in
+        let hi = CT.add (CT.add lo' wd') (const (-1)) in
+        let* s = wd' >>| Theory.Value.sort in
+        (CT.extract s hi lo' (to_bits e')) >>| Theory.Value.forget
+    | Expr_TApply(FIdent("replicate_bits", _), _, [e; n]) ->
+        let* n' = force_int n in
+        let e' = compile_expr e |> to_bits in
+        let* v = e' in
+        let en = Theory.Bitv.size (Theory.Value.sort v) in
+        List.fold_left (fun acc i -> 
+          CT.append (Theory.Bitv.define (en * i)) acc (KB.return v)
+        ) (KB.return v) (List.init (n' - 1) (fun x -> x + 2)) >>| Theory.Value.forget
+    | Expr_TApply(f, _, [e]) ->
+        (match Asl_ast.name_of_FIdent f with
+        | "not_bits" ->
+            CT.not (compile_expr e |> to_bits) >>| Theory.Value.forget
+        | "cvt_bool_bv" ->
+            let s = Theory.Bitv.define 1 in
+            let (module MX) = Bitvec.modular 1 in
+            let const x = CT.int (s) (MX.int x) in
+            let eBool = compile_expr e |> to_bool in
+            (CT.ite eBool (const 1) (const 0)) >>| Theory.Value.forget
+        | n -> fail (Unknown_primop n))
+    | Expr_TApply(f, targs, [e1; e2]) ->
+        let* v1 = compile_expr e1 |> to_bits in
+        let* v2 = compile_expr e2 |> to_bits in
+        let n1 = Theory.Bitv.size (Theory.Value.sort v1) in
+        let n2 = Theory.Bitv.size (Theory.Value.sort v2) in
+        let e1' = KB.return v1 in
+        let e2' = KB.return v2 in
+        (match Asl_ast.name_of_FIdent f with
+        | "or_bits"   -> CT.logor e1' e2' >>| Theory.Value.forget
+        | "and_bits"  -> CT.logand e1' e2' >>| Theory.Value.forget
+        | "eor_bits"  -> CT.logxor e1' e2' >>| Theory.Value.forget
+        | "eq_bits"   -> CT.eq e1' e2' >>| Theory.Value.forget
+        | "add_bits"  -> CT.add e1' e2' >>| Theory.Value.forget
+        | "sub_bits"  -> CT.sub e1' e2' >>| Theory.Value.forget
+        | "mul_bits"  -> CT.mul e1' e2' >>| Theory.Value.forget
+        | "sdiv_bits" -> CT.sdiv e1' e2' >>| Theory.Value.forget
+        | "lsl_bits"  -> CT.lshift e1' e2' >>| Theory.Value.forget
+        | "lsr_bits"  -> CT.rshift e1' e2' >>| Theory.Value.forget
+        | "asr_bits"  -> CT.arshift e1' e2' >>| Theory.Value.forget
+        | "slt_bits"  -> CT.slt e1' e2' >>| Theory.Value.forget
+        | "sle_bits"  -> CT.sle e1' e2' >>| Theory.Value.forget
+        | "append_bits" -> 
+            CT.append (Theory.Bitv.define (n1 + n2)) (KB.return v1) (KB.return v2) >>| Theory.Value.forget
+        | "ZeroExtend" ->
+            (match targs with
+            | [_;  Expr_LitInt(n)] ->
+                let n' = int_of_string n in
+                CT.unsigned (Theory.Bitv.define n') e1' >>| Theory.Value.forget
+            | _ -> fail (Unknown_primop "ZeroExtend"))
+        | "SignExtend" ->
+            (match targs with
+            | [_;  Expr_LitInt(n)] ->
+                let n' = int_of_string n in
+                CT.signed (Theory.Bitv.define n') e1' >>| Theory.Value.forget
+            | _ -> fail (Unknown_primop "SignExtend"))
+        (* TODO: implement round_tozero_real for aarch64_integer_arithmetic_div *)
+        | n -> fail (Unknown_primop n))
+
+    (* Other *)
+    | Expr_Parens(e) -> compile_expr e 
+    | _ -> fail (Unhandled_expr (Asl_utils.pp_expr e))
 
   and compile_stmt (s: Asl_ast.stmt): unit Theory.eff =
     match s with
@@ -350,60 +338,54 @@ module Make(CT : Theory.Core) = struct
           let dst = r' |> to_bits in
           ctrl @@ CT.jmp dst)
     | Stmt_Assign(l, r, _) ->
-      let r' = compile_expr r in
-      (match l with
-      | LExpr_Write(FIdent(i, n), tes, es) ->
-          let* v = State.findVar ("R" ^ string_of_int n) in
-          data @@ CT.set v r'
-      | LExpr_Array(LExpr_Var(Ident "_R"), Expr_LitInt(s)) ->
-          let* v = State.findVar ("R" ^ s) in
-          data @@ CT.set v r'
-      | LExpr_Array(LExpr_Var(Ident "_Z"), Expr_LitInt(s)) ->
-          let* v = State.findVar ("V" ^ s) in
-          data @@ CT.set v r'
-      | LExpr_Var(Ident(i)) ->
-        let* state = State.get in
-        (match Variables.find_opt i state.vars with
-        | Some var -> data @@ CT.set var r'
-        | None -> 
+        let r' = compile_expr r in
+        (match l with
+        | LExpr_Write(FIdent(i, n), tes, es) ->
+            let* v = State.findVar ("R" ^ string_of_int n) in
+            data @@ CT.set v r'
+        | LExpr_Array(LExpr_Var(Ident "_R"), Expr_LitInt(s)) ->
+            let* v = State.findVar ("R" ^ s) in
+            data @@ CT.set v r'
+        | LExpr_Array(LExpr_Var(Ident "_Z"), Expr_LitInt(s)) ->
+            let* v = State.findVar ("V" ^ s) in
+            data @@ CT.set v r'
+        | LExpr_Var(Ident(i)) ->
+          let* state = State.get in
+          (match Variables.find_opt i state.vars with
+          | Some var -> data @@ CT.set var r'
+          | None -> 
+              let* ign = ign_var i in
+              if ign then nop
+              else fail (Unknown_variable i)
+          )
+        | LExpr_Field(LExpr_Var(Ident "PSTATE"), Ident f) ->
+            let i = f ^ "F" in
             let* ign = ign_var i in
             if ign then nop
-            else fail (Unknown_variable i)
-        )
-      | LExpr_Field(LExpr_Var(Ident "PSTATE"), Ident f) ->
-          let i = f ^ "F" in
-          let* ign = ign_var i in
-          if ign then nop
-          else let* v = State.findVar (f ^ "F") in data @@ CT.set v r'
-      | _ ->
-        fail (Unhandled_lexpr (Asl_utils.pp_lexpr l))
-      )
+            else let* v = State.findVar (f ^ "F") in data @@ CT.set v r'
+        | _ -> fail (Unhandled_lexpr (Asl_utils.pp_lexpr l)))
     | Stmt_If(c, t, els, e, loc) ->
-      let rec do_if xs e = (match xs with
-        | [] -> compile_stmts e 
-        | Asl_ast.S_Elsif_Cond (cond, b)::xs' -> 
-          let cond' = compile_expr cond in
-          let cond'' = to_bool  cond' in
-          let b' = compile_stmts b in
-          let rest = do_if xs' e in
-          CT.branch cond'' b' rest
-      ) in
-      (do_if (Asl_ast.S_Elsif_Cond(c, t)::els) e)
+        let rec do_if xs e = (match xs with
+          | [] -> compile_stmts e 
+          | Asl_ast.S_Elsif_Cond (cond, b)::xs' -> 
+            let cond' = compile_expr cond |> to_bool in
+            let b' = compile_stmts b in
+            let rest = do_if xs' e in
+            CT.branch cond' b' rest
+        ) in
+        do_if (Asl_ast.S_Elsif_Cond(c, t)::els) e
     | Stmt_TCall(FIdent("Mem.set", 0), _, [addr; size; _; value], _) ->
-      let* memVar = State.findVar "mem" in
-      let addr' = compile_expr addr |> to_bits in
-      let value' = compile_expr value |> to_bits in
-      let mem = get_var "mem" |> to_mem in
-      let newMem = CT.storew CT.b0 mem addr' value' >>| Theory.Value.forget in
-      data @@ CT.set memVar newMem 
-    | Stmt_Assert(_, _) ->
-      (* TODO: perform some kind of intrinsic call *)
-      nop
-    | Stmt_Throw(_, _) ->
-      (* TODO: perform some kind of intrinsic call *)
-      nop
-    | _ ->
-      fail (Unhandled_stmt (Asl_utils.pp_stmt s))
+        let* memVar = State.findVar "mem" in
+        let addr' = compile_expr addr |> to_bits in
+        let value' = compile_expr value |> to_bits in
+        let oldMem = get_var "mem" |> to_mem in
+        let newMem = CT.storew CT.b0 oldMem addr' value' >>| Theory.Value.forget in
+        data @@ CT.set memVar newMem 
+
+    (* TODO: perform some kind of intrinsic call *)
+    | Stmt_Assert(_, _) -> nop
+    | Stmt_Throw(_, _) -> nop
+    | _ -> fail (Unhandled_stmt (Asl_utils.pp_stmt s))
   
   and compile_stmts (stmts: Asl_ast.stmt list): unit Theory.eff  =
     seq (List.map compile_stmt stmts)
@@ -437,9 +419,10 @@ module Make(CT : Theory.Core) = struct
     Ignored.add "BTypeCompatible" |>
     Ignored.add "BTypeNext"
 
-  let run p stmts =
+  let run inst p stmts =
     let* () = State.updateVars (fun _ -> initialize_vars) in
     let* () = State.updateIgn (fun _ -> initialize_ign) in
+    let* () = State.setInst inst in
     let c = compile_stmts stmts in
     CT.seq p c
 
@@ -454,7 +437,7 @@ let lifter env throwErrors label =
     let str = Bitvec.to_string (Bitvector.to_bitvec w) in
     let address = Some (Bitvec.to_string addr) in
     try 
-      (Cmplr.run kb (Dis.retrieveDisassembly ?address env str), opcount + 1)
+      (Cmplr.run str kb (Dis.retrieveDisassembly ?address env str), opcount + 1)
     with 
     | Error(s) -> Printf.printf "%s had BAP error: %s\n" str s; (kb, opcount + 1)
     | exn -> 
