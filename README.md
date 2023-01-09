@@ -9,25 +9,6 @@ To build and run this plugin, you'll need:
 *   BAP, likely a version greater than 2.5.0
 *   [ASLi](https://github.com/UQ-PAC/asl-interpreter/blob/partial_eval) with partial evaluation
 
-### BAP
-
-Install BAP using the standard install instructions, such as `opam install bap`.
-
-### ASLi
-
-Checkout and install ASLi following its README or the summarised steps below.
-Note that this plugin must be rebuilt to include any changes to the ASLi project.
-
-```
-opam install dune z3 zarith alcotest ocamlfind pprint ott menhir linenoise
-export LD_LIBRARY_PATH=`opam var z3:lib`
-eval $(opam env)
-git clone -b partial_eval https://github.com/UQ-PAC/asl-interpreter.git
-make -C asl-interpreter install
-```
-
-### Plugin
-
 If the requirements have been installed, run `make` in this directory to build and install the plugin.
 
 ## Use
