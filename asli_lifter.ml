@@ -248,13 +248,16 @@ module Make(CT : Theory.Core) = struct
         | n -> fail (Unknown_primop n)) 
 
     (* Bitvector Expressions *)
-    | Expr_Slices(e, [Slice_LoWd(lo, wd)]) ->
+    (* TODO: remove this and just use general case? *)
+    | Expr_Slices(e, [Slice_LoWd(Expr_LitInt lo, Expr_LitInt wd)]) ->
         let e' = compile_expr e in
-        let lo' = compile_expr lo |> to_bits in
-        let wd' = compile_expr wd |> to_bits in
-        let hi = CT.add (CT.add lo' wd') (const (-1)) in
-        let* s = wd' >>| Theory.Value.sort in
-        (CT.extract s hi lo' (to_bits e')) >>| Theory.Value.forget
+        let lo' = int_of_string lo in
+        let wd' = int_of_string wd in
+        let hi = lo' + wd' - 1 in
+        let s = Theory.Bitv.define wd' in
+        let (module MX) = Bitvec.modular const_width in
+        let const x = CT.int (Theory.Bitv.define const_width) (MX.int x) in
+        (CT.extract s (const hi) (const lo') (to_bits e')) >>| Theory.Value.forget
     | Expr_TApply(FIdent("replicate_bits", _), _, [e; n]) ->
         let* n' = force_int n in
         let e' = compile_expr e |> to_bits in
