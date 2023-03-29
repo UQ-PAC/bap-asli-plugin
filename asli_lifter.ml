@@ -9,7 +9,7 @@ include Self()
 module Variables = Map.Make(String)
 module Ignored = Set.Make(String)
 
-type KB.Conflict.t +=
+type error =
   | Unknown_primop of string
   | Unhandled_stmt of string
   | Unhandled_expr of string
@@ -17,6 +17,10 @@ type KB.Conflict.t +=
   | Unhandled_type of string
   | Failed_conversion of string
   | Unknown_variable of string
+  | ASL_error of string
+
+type KB.Conflict.t +=
+  | Asl_plugin        of string * error
 
 exception Error of string
 
@@ -24,14 +28,12 @@ module State = struct
   type t = {
     vars: unit Theory.Var.t Variables.t;
     ign: Ignored.t;
-    throwErrors: bool;
     inst: string;
   }
 
   let empty = {
     vars = Variables.empty;
     ign = Ignored.empty;
-    throwErrors = true;
     inst = "";
   }
 
@@ -46,9 +48,8 @@ module State = struct
     let f st = 
       let vars = upd st.vars in
       let ign = st.ign in
-      let throwErrors = st.throwErrors in
       let inst = st.inst in
-      { vars; ign; throwErrors; inst }
+      { vars; ign; inst }
     in
     update f
 
@@ -56,9 +57,8 @@ module State = struct
     let f st = 
       let vars = st.vars in
       let ign = upd st.ign in
-      let throwErrors = st.throwErrors in
       let inst = st.inst in
-      { vars; ign; throwErrors; inst}
+      { vars; ign; inst}
     in
     update f
 
@@ -70,8 +70,7 @@ module State = struct
     let f st = 
       let vars = st.vars in
       let ign = st.ign in
-      let throwErrors = st.throwErrors in
-      { vars; ign; throwErrors; inst}
+      { vars; ign; inst}
     in
     update f
 
@@ -96,27 +95,14 @@ let drop_chars (x: string) (c: char): string =
   (* create result *)
   String.init !len next_char
 
-let fail (errorType: KB.conflict) = 
+let fail (errorType: error) =
   let* st = State.get in
-  if st.throwErrors then
-    let typeString = match errorType with
-      | Unknown_primop(m)    -> st.inst ^ ": Unknown primitive operation: " ^ m
-      | Unhandled_stmt(m)    -> st.inst ^ ": Unhandled statement type: " ^ m
-      | Unhandled_expr(m)    -> st.inst ^ ": Unhandled expression: " ^ m
-      | Unhandled_lexpr(m)   -> st.inst ^ ": Unhandled Lexpression: " ^ m
-      | Unhandled_type(m)    -> st.inst ^ ": Unhandled type: " ^ m
-      | Failed_conversion(m) -> st.inst ^ ": Failed conversion: " ^ m
-      | Unknown_variable(m)  -> st.inst ^ ": Unknown variable: " ^ m
-      | _ -> "Unknown error"
-    in 
-    raise (Error typeString)
-  else
-    KB.fail errorType
+  KB.fail (Asl_plugin (st.inst,errorType))
 
-let to_bits e = e >>= fun ue -> 
+let to_bits e = e >>= fun ue ->
   match Theory.Value.resort (fun x -> (Theory.Bitv.refine x)) ue with
   | Some x -> KB.return x
-  | None -> fail (Failed_conversion "Unable to convert value to bits") 
+  | None -> fail (Failed_conversion "Unable to convert value to bits")
 
 let defined e =
   match e with
@@ -162,7 +148,7 @@ module Make(CT : Theory.Core) = struct
     let (module MX) = Bitvec.modular const_width in
     CT.int (Theory.Bitv.define const_width) (MX.int x)
 
-  let get_var s : unit Theory.Value.t KB.t = 
+  let get_var s : unit Theory.Value.t KB.t =
     let* st = State.get in
     match Variables.find_opt s st.vars with
     | Some var -> CT.var var
@@ -393,6 +379,14 @@ module Make(CT : Theory.Core) = struct
   and compile_stmts (stmts: Asl_ast.stmt list): unit Theory.eff  =
     seq (List.map compile_stmt stmts)
    
+  let run st inst p stmts =
+    let* () = State.set st in
+    let* () = State.setInst inst in
+    let c = compile_stmts stmts in
+    CT.seq p c
+
+end
+
   let initialize_vars =
     (* 64-bit registers *)
     List.fold_left (fun vars var -> 
@@ -408,6 +402,8 @@ module Make(CT : Theory.Core) = struct
     Variables.add "CF" (Theory.Var.forget (Theory.Var.define (Theory.Bitv.define 1) "CF")) |>
     Variables.add "VF" (Theory.Var.forget (Theory.Var.define (Theory.Bitv.define 1) "VF")) |>
 
+    Variables.add "FPCR" (Theory.Var.forget (Theory.Var.define (Theory.Rmode.t) "FPCR")) |>
+
     (* Special registers *)
     (fun v -> Variables.add "SP_EL0" (Variables.find "R31" v) v) |>
 
@@ -422,45 +418,46 @@ module Make(CT : Theory.Core) = struct
     Ignored.add "BTypeCompatible" |>
     Ignored.add "BTypeNext"
 
-  let run inst p stmts =
-    let* () = State.updateVars (fun _ -> initialize_vars) in
-    let* () = State.updateIgn (fun _ -> initialize_ign) in
-    let* () = State.setInst inst in
-    let c = compile_stmts stmts in
-    CT.seq p c
+let st = {State.empty with vars = initialize_vars ; ign = initialize_ign}
 
-end
+let errorMsg e = 
+  match e with
+  | Asl_plugin (inst,errorType) ->
+    (match errorType with
+    | Unknown_primop(m)    -> inst ^ ": Unknown primitive operation: " ^ m
+    | Unhandled_stmt(m)    -> inst ^ ": Unhandled statement type: " ^ m
+    | Unhandled_expr(m)    -> inst ^ ": Unhandled expression: " ^ m
+    | Unhandled_lexpr(m)   -> inst ^ ": Unhandled Lexpression: " ^ m
+    | Unhandled_type(m)    -> inst ^ ": Unhandled type: " ^ m
+    | Failed_conversion(m) -> inst ^ ": Failed conversion: " ^ m
+    | Unknown_variable(m)  -> inst ^ ": Unknown variable: " ^ m
+    | ASL_error s          -> inst ^ ": ASL error: " ^ s)
+  | _ -> "Unknown error"
 
-let lifter env throwErrors label =
+let lifter env lenv label =
   let* mem = label-->?Memory.slot in
   let* addr = label-->?Theory.Label.addr in
   let* (module CT) = Theory.current in
   let module Cmplr = Make(CT) in
-  let (kb, opcount) = Memory.fold ~word_size:Size.r32 mem ~init:(Cmplr.nop,0) ~f:(fun w (kb,opcount) ->
+  let kb = Memory.fold ~word_size:Size.r32 mem ~init:(Cmplr.nop) ~f:(fun w kb ->
     let str = Bitvec.to_string (Bitvector.to_bitvec w) in
     let address = Some (Bitvec.to_string addr) in
     try 
-      (Cmplr.run str kb (Dis.retrieveDisassembly ?address env str), opcount + 1)
-    with 
-    | Error(s) -> Printf.printf "%s had BAP error: %s\n" str s; (kb, opcount + 1)
-    | exn -> 
-      let error = String.trim (Printexc.to_string exn) in
-      let backtrace = Printexc.get_backtrace () in
-      let firstbacktrace = List.hd (String.split_on_char '\n' backtrace) in
-      Printf.printf "%s had ASL error: %s, %s\n" str error firstbacktrace; (kb,opcount + 1)
+      Cmplr.run st str kb (Dis.retrieveDisassembly ?address env lenv str)
+    with exn ->
+        let error = String.trim (Printexc.to_string exn) in
+        let backtrace = Printexc.get_backtrace () in
+        let firstbacktrace = List.hd (String.split_on_char '\n' backtrace) in
+        KB.fail (Asl_plugin (str, ASL_error (Printf.sprintf "%s had ASL error: %s, %s\n" str error firstbacktrace)))
   ) in
-  let* i = kb in
-  let* m = Cmplr.nop in
+  KB.catch kb (fun e -> Printf.printf "%s\n" (errorMsg e); !!Insn.empty) >>= fun i ->
   KB.collect Disasm_expert.Basic.Insn.slot label >>| function
-  | Some basic when Insn.(i <> empty) ->
-      Insn.with_basic i basic
-  | Some basic ->
-      Insn.with_basic m basic
+  | Some basic when Insn.(i <> empty) -> Insn.with_basic i basic
   | _ -> i
 
-let load prelude specs throwErrors =
-  Dis.debug_show_trace := true;
+let load prelude specs =
   let prelude = LoadASL.read_file prelude true false in
   let mra = List.map (fun tool -> LoadASL.read_file tool false false) specs in
   let env = Eval.build_evaluation_environment (List.concat (prelude::mra)) in
-  KB.promise Theory.Semantics.slot (lifter env throwErrors)
+  let denv = Dis.build_env env in
+  KB.promise Theory.Semantics.slot (lifter env denv)
