@@ -24,5 +24,5 @@ end
 let () = Bap_main.Extension.declare ~doc @@ fun ctxt -> 
   let prelude = ctxt-->prelude in
   let specs = List.concat (ctxt-->specs) in
-  if ctxt-->disable then Ok () else
+  if ctxt-->disable || prelude = "" then Ok () else
   Ok (Asli_lifter.load prelude specs)
