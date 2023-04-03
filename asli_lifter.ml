@@ -416,7 +416,8 @@ end
     Ignored.add "nRWF" |>
     Ignored.add "InGuardedPage" |>
     Ignored.add "BTypeCompatible" |>
-    Ignored.add "BTypeNext"
+    Ignored.add "BTypeNext" |>
+    Ignored.add "__BranchTaken"
 
 let st = {State.empty with vars = initialize_vars ; ign = initialize_ign}
 
