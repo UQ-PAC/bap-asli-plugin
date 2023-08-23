@@ -163,6 +163,14 @@ module Make(CT : Theory.Core) = struct
         KB.return (Z.to_int (Z.of_string_base 10 s))
     | _ -> fail (Failed_conversion "Unable to get option")
 
+  let invoke_symbol name =
+    let name = KB.Name.create
+        ~package:"intrinsic"
+        KB.Name.(unqualified@@read name) in
+    let* dst = Theory.Label.for_name (KB.Name.show name) in
+    KB.provide Theory.Label.is_subroutine dst (Some true) >>= fun () ->
+    CT.goto dst
+
   let rec compile_var (t: Asl_ast.ty) (ident: string) (value: Asl_ast.expr option): unit Theory.eff =
     let add_state t' = 
       let* var = Theory.Var.fresh t' in
@@ -369,7 +377,12 @@ module Make(CT : Theory.Core) = struct
         let value' = compile_expr value |> to_bits in
         let oldMem = get_var "mem" |> to_mem in
         let newMem = CT.storew CT.b0 oldMem addr' value' >>| Theory.Value.forget in
-        data @@ CT.set memVar newMem 
+        data @@ CT.set memVar newMem
+
+    | Stmt_TCall(FIdent("AtomicStart", 0), _, _, _) ->
+        ctrl @@ invoke_symbol "AtomicStart"
+    | Stmt_TCall(FIdent("AtomicEnd", 0), _, _, _) ->
+        ctrl @@ invoke_symbol "AtomicEnd"
 
     (* TODO: perform some kind of intrinsic call *)
     | Stmt_Assert(_, _) -> nop
