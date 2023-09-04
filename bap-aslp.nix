@@ -1,14 +1,14 @@
-{ stdenv, makeBinaryWrapper, bap-plugins, aslp, aslp-plugin }:
-  let _bap = (bap-plugins.override { plugins = [ aslp-plugin ]; });
+{ stdenv, makeBinaryWrapper, bap-plugins, asli, asli-plugin }:
+  let _bap = (bap-plugins.override { plugins = [ asli-plugin ]; });
   in stdenv.mkDerivation {
     name = "bap-aslp";
-    buildInputs = [ _bap aslp ];
+    buildInputs = [ _bap asli ];
     nativeBuildInputs = [ makeBinaryWrapper ];
     unpackPhase = "true";
     installPhase = ''
       mkdir -p $out/bin
 
-      ASLI_PATH=${aslp}/asl
+      ASLI_PATH=${asli}/asl
       cd ${_bap}/bin
       for b in *; do 
         makeBinaryWrapper "$(pwd)/$b" $out/bin/$b-aslp \

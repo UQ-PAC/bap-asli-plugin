@@ -1,6 +1,6 @@
 { stdenv,
   lib,
-  aslp,
+  asli,
   ocamlPackages, 
 }:
 
@@ -11,7 +11,7 @@ stdenv.mkDerivation {
 
   src = (lib.sourceByRegex ./. [".*\\.ml" "Makefile"]);
 
-  buildInputs = [ aslp ocamlPackages.bap ocamlPackages.findlib ];
+  buildInputs = [ asli ocamlPackages.bap ocamlPackages.findlib ];
 
   buildPhase = ''
     runHook preBuild
