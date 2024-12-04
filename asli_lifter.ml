@@ -240,6 +240,12 @@ module Make(CT : Theory.Core) = struct
         | "or_bool" -> CT.or_ e1' e2' >>| Theory.Value.forget
         | "and_bool" -> CT.and_ e1' e2' >>| Theory.Value.forget
         | n -> fail (Unknown_primop n)) 
+    | Expr_TApply(FIdent("ite", 0), [w], [c; t; f]) ->
+        let c = compile_expr c |> to_bool in
+        let t = compile_expr t |> to_bits in
+        let f = compile_expr f |> to_bits in
+        CT.ite c t f >>| Theory.Value.forget
+
 
     (* Bitvector Expressions *)
     (* TODO: remove this and just use general case? *)
