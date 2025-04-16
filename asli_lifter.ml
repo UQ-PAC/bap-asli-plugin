@@ -293,6 +293,7 @@ module Make(CT : Theory.Core) = struct
         | "sub_bits"  -> CT.sub e1' e2' >>| Theory.Value.forget
         | "mul_bits"  -> CT.mul e1' e2' >>| Theory.Value.forget
         | "sdiv_bits" -> CT.sdiv e1' e2' >>| Theory.Value.forget
+        | "udiv_bits" -> CT.div e1' e2' >>| Theory.Value.forget
         | "lsl_bits"  -> CT.lshift e1' e2' >>| Theory.Value.forget
         | "lsr_bits"  -> CT.rshift e1' e2' >>| Theory.Value.forget
         | "asr_bits"  -> CT.arshift e1' e2' >>| Theory.Value.forget
